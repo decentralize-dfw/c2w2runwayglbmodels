@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Three.js Model Viewer with FPS Controls</title>
+    <style>
+        body { margin: 0; overflow: hidden; } /* Scrollbar'ları kaldır */
+        canvas { display: block; }
+        #loading { position: absolute; top: 10px; left: 10px; color: white; display: none; } /* Başlangıçta gizli, sadece yüklenirken göster */
+        #instructions { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 24px; text-align: center; }
+        #initiating { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 48px; display: none; }
+        #ended { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 48px; display: none; }
+        #description { position: absolute; bottom: 10px; left: 50px; right: 50px; color: white; font-size: 10px; font-family: Helvetica; font-weight: 500; text-align: center; display: none; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="loading">Yükleniyor...</div>
+    <div id="instructions">Tıkla ve kilitle<br/>WASD: Yürü<br/>Boşluk: Zıpla<br/>Fare: Bak</div>
+    <div id="initiating">Initiating...</div>
+    <div id="ended">Experience Ended</div>
+    <button id="startButton" style="position: absolute; left: 10px; bottom: 10px; font-size: 12px;">Start</button>
+    <button id="fullscreenButton" style="position: absolute; left: 10px; top: 10px; font-size: 12px;">Full Screen</button>
+    <div id="description"></div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+        import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.3; // HDR'ı %30'a çıkar
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.physicallyCorrectLights = true;
+        document.body.appendChild(renderer.domElement);
+
+        // Audio Listener
+        const audioListener = new THREE.AudioListener();
+        camera.add(audioListener);
+
+        // PointerLockControls
+        const controls = new PointerLockControls(camera, document.body);
+        scene.add(controls.getObject());
+
+        const blocker = document.getElementById('instructions');
+        let firstTime = true;
+        blocker.addEventListener('click', () => {
+            controls.lock();
+        });
+
+        controls.addEventListener('lock', () => {
+            blocker.style.display = 'none';
+            firstTime = false;
+        });
+
+        controls.addEventListener('unlock', () => {
+            if (firstTime) {
+                blocker.style.display = 'block';
+            } // Sadece ilk seferde göster, sonra gösterme
+        });
+
+        // Herhangi bir click ile relock (ESC sonrası) - Tek tık için try-catch ile hata yönet
+        document.addEventListener('click', () => {
+            if (!controls.isLocked && !firstTime) {
+                controls.lock().catch((error) => {
+                    console.error('Pointer Lock hatası:', error);
+                });
+            }
+        });
+
+        // Hareket değişkenleri
+        let baseMoveSpeed = 20;
+        let currentMoveSpeed = baseMoveSpeed;
+        const jumpVelocity = 5;
+        let velocity = new THREE.Vector3();
+        let direction = new THREE.Vector3();
+        let prevTime = performance.now();
+        const gravity = 9.8;
+        let onFloor = true;
+        let isSprinting = false;
+
+        const keys = { forward: false, backward: false, left: false, right: false, jump: false, sprint: false };
+
+        document.addEventListener('keydown', (event) => {
+            switch (event.code) {
+                case 'KeyW': keys.forward = true; break;
+                case 'KeyS': keys.backward = true; break;
+                case 'KeyA': keys.left = true; break;
+                case 'KeyD': keys.right = true; break;
+                case 'Space': if (onFloor) { keys.jump = true; } break;
+                case 'ShiftLeft': keys.sprint = true; currentMoveSpeed = baseMoveSpeed * 4; break;
+            }
+        });
+
+        document.addEventListener('keyup', (event) => {
+            switch (event.code) {
+                case 'KeyW': keys.forward = false; break;
+                case 'KeyS': keys.backward = false; break;
+                case 'KeyA': keys.left = false; break;
+                case 'KeyD': keys.right = false; break;
+                case 'Space': keys.jump = false; break;
+                case 'ShiftLeft': keys.sprint = false; currentMoveSpeed = baseMoveSpeed; break;
+            }
+        });
+
+        // Gerçekçi ortam haritası (HDR) - Background olarak da göster
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        pmremGenerator.compileEquirectangularShader();
+        new RGBELoader().load('https://raw.githubusercontent.com/decentralize-dfw/c2w2/main/DARK-NEBULA.hdr', (texture) => {
+            const envMap = pmremGenerator.fromEquirectangular(texture).texture;
+            scene.environment = envMap;
+            scene.background = envMap; // Background olarak göster
+            texture.dispose();
+            pmremGenerator.dispose();
+        });
+
+        // Işıklar
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.1);
+        scene.add(ambientLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 5);
+        directionalLight.position.set(5, 10, 5);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        directionalLight.shadow.camera.near = 0.5;
+        directionalLight.shadow.camera.far = 500;
+        scene.add(directionalLight);
+        const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.1);
+        hemisphereLight.position.set(0, 20, 0);
+        scene.add(hemisphereLight);
+
+        // Güçlü dramatik directional ışık
+        const dramaticLight = new THREE.DirectionalLight(0xffffff, 100);
+        dramaticLight.position.set(0, 30, 0);
+        dramaticLight.castShadow = true;
+        dramaticLight.shadow.mapSize.width = 4096;
+        dramaticLight.shadow.mapSize.height = 4096;
+        dramaticLight.shadow.camera.near = 0.5;
+        dramaticLight.shadow.camera.far = 100;
+        dramaticLight.shadow.camera.left = -20;
+        dramaticLight.shadow.camera.right = 20;
+        dramaticLight.shadow.camera.top = 20;
+        dramaticLight.shadow.camera.bottom = -20;
+        dramaticLight.shadow.bias = -0.005;
+        scene.add(dramaticLight);
+
+        // GLTF Loader
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+        dracoLoader.setDecoderConfig({ type: 'js' });
+        const gltfLoader = new GLTFLoader();
+        gltfLoader.setDRACOLoader(dracoLoader);
+        gltfLoader.setMeshoptDecoder(MeshoptDecoder);
+
+        // Ana mekan GLB'sini yükle
+        const spaceUrl = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/space-opt.glb';
+        document.getElementById('loading').style.display = 'block'; // Yükleme sırasında göster
+        gltfLoader.load(
+            spaceUrl,
+            (gltf) => {
+                const spaceModel = gltf.scene;
+                spaceModel.position.set(0, 0, 0);
+                spaceModel.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+                scene.add(spaceModel);
+                console.log('Mekan yüklendi!');
+                document.getElementById('loading').style.display = 'none'; // Yükleme tamamlanınca gizle
+            },
+            (xhr) => {
+                document.getElementById('loading').textContent = `Yükleniyor: ${(xhr.loaded / xhr.total * 100).toFixed(2)}%`;
+            },
+            (error) => {
+                console.error('Mekan yükleme hatası:', error);
+                document.getElementById('loading').textContent = 'Hata: Mekan yüklenemedi!';
+            }
+        );
+
+        // Model URL'leri
+        const modelUrls = [
+          'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/bellicapelli-900-opt-v1.glb', // Model 1
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/matisse_purp-900y-opt-v10.glb', // Model 2
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/bacon-freud-900-opt-v3.glb', // Model 3
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/baconscene-900-opt-v4.glb', // Model 4
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/mutantbacon-900-opt-v9.glb', // Model 5
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/squallo-900-opt-v14.glb', // Model 6
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/curator-900-threejs-opt-v1.glb', // Model 7
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/joker-900-opt-v4.glb', // Model 8
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/bulkgelin-900-opt-v17.glb', // Model 9
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/mare-900-opt-v3.glb', // Model 10
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/memelegancedress-900-opt-v12.glb', // Model 11
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/whitewearsdfw-900-opt-v16.glb', // Model 12
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/invertmemelegancesuit-900-opt-v5.glb', // Model 13
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/pile-900-optopotooo-opt-v8.glb', // Model 14
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/redpunkaqqqqq-900-opt-v9.glb', // Model 15
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/memelegancesuit-900-opt-v11.glb', // Model 16
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/saturnweekend-900-v2-threejs-opt-v2.glb', // Model 17
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/6529memes-750-25fps-opt-v18.glb', // Model 18
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/artdecc0-2k-webp-opt-meshoptv3.glb', // Model 19
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/xcopy-900-opt-v17.glb', // Model 20
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/C2W2_rich-ailu-scene900-opt-v4.glb', // Model 21
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/gooner-900-opt-v10.glb', // Model 22
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/davicni-900-opt-v15.glb', // Model 23
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/cozom-900-2k-webp-opt-draco-v5.glb', // Model 24
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/beeple-900-opt-v6.glb', // Model 25
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/samsprat-900-opt-v12.glb', // Model 26
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/asiah-900-threejs-opt-v3.glb', // Model 27
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/chrometiger-opt-v2.glb', // Model 28
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/teddyminator-900-opt-v4.glb', // Model 29
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/asian-900-opt-v2.glb', // Model 30
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/mafiaclown-ems-900-opt-v2.glb', // Model 31
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/samu-900-opt-v6.glb', // Model 32
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/baiencaigai-900-opt-v4.glb', // Model 33
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/c-rabbit-opt-v5.glb', // Model 34
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/neo-900-opt-v2.glb', // Model 35
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/psyclown-900-opt-v1.glb', // Model 36
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/xeu2-900-threejs-opt-v1.glb', // Model 37
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/papaz-900-threejs-opt-v4.glb', // Model 38
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/sleekrobobitchspikey-900-opt-v6.glb', // Model 39
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/donmac-900-opt-v8.glb', // Model 40
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/redwearsdfw-900-opt-v8.glb', // Model 41
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/cybergesu-900-opt-v4.glb', // Model 42
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/steve-900-opt-v15.glb', // Model 43
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/millefeuille-dobby-900-opt-v10.glb', // Model 44
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/junya-900-opt-v3.glb', // Model 45
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/electrogod-900-threejs-opt-v5.glb', // Model 46
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/davicni-900-threejs-opt-v6.glb', // Model 47
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/curator-900-opt-v7.glb', // Model 48
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/memelegancesuit-fup-900-opt-v1.glb', // Model 49
+    'https://raw.githubusercontent.com/decentralize-dfw/c2w2runwayglbmodels/main/asiah-900-opt-v1.glb', // Model 50
+];
+            
+        
+         // https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/cybergesu-900-opt-v4.glb',
+         //'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/joker-900-opt-v4.glb',
+        // Model açıklamaları (placeholder, gerçek metinleri ekle)
+        const modelDescriptions = [
+            'Model 1: This is the joker model.', // Model 1
+            'Model 2: This is the 6529memes model.', // Model 2
+            'Model 3: This is the donmac model.', // Model 3
+            'Model 4: This is the charmander model.', // Model 4
+            'Model 5: This is the cybergesu model.', // Model 5
+            'Model 6: This is the bacon-freud model.', // Model 6
+            'Model 7: This is the junya model.', // Model 7
+            'Model 8: This is the c-rabbit model.', // Model 8
+             'Model 1: This is the joker model.', // Model 1
+            'Model 2: This is the 6529memes model.', // Model 2
+            'Model 3: This is the donmac model.', // Model 3
+            'Model 4: This is the charmander model.', // Model 4
+            'Model 5: This is the cybergesu model.', // Model 5
+            'Model 6: This is the bacon-freud model.', // Model 6
+            'Model 7: This is the junya model.', // Model 7
+            'Model 8: This is the c-rabbit model.', // Model 8
+             'Model 1: This is the joker model.', // Model 1
+            'Model 2: This is the 6529memes model.', // Model 2
+            'Model 3: This is the donmac model.', // Model 3
+            'Model 4: This is the charmander model.', // Model 4
+            'Model 5: This is the cybergesu model.', // Model 5
+            'Model 6: This is the bacon-freud model.', // Model 6
+            'Model 7: This is the junya model.', // Model 7
+            'Model 8: This is the c-rabbit model.', // Model 8
+             'Model 1: This is the joker model.', // Model 1
+            'Model 2: This is the 6529memes model.', // Model 2
+            'Model 3: This is the donmac model.', // Model 3
+            'Model 4: This is the charmander model.', // Model 4
+            'Model 5: This is the cybergesu model.', // Model 5
+            'Model 6: This is the bacon-freud model.', // Model 6
+            'Model 7: This is the junya model.', // Model 7
+            'Model 8: This is the c-rabbit model.' // Model 8
+            
+        ];
+
+        const models = []; // {model, mixer, animated: false}
+
+        function loadModel(index) {
+            return new Promise((resolve, reject) => {
+                gltfLoader.load(
+                    modelUrls[index - 1],
+                    (gltf) => {
+                        const modelScene = gltf.scene;
+                        modelScene.position.set(0, 0, 0);
+                        modelScene.traverse((child) => {
+                            if (child.isMesh) {
+                                child.castShadow = true;
+                                child.receiveShadow = true;
+                            }
+                        });
+                        scene.add(modelScene);
+
+                        let mixer = null;
+                        if (gltf.animations && gltf.animations.length > 0) {
+                            mixer = new THREE.AnimationMixer(modelScene);
+                            gltf.animations.forEach((clip) => {
+                                const action = mixer.clipAction(clip);
+                                action.loop = THREE.LoopRepeat; // Loop yap
+                            });
+                        }
+
+                        models[index] = { model: modelScene, mixer, animated: false };
+                        console.log(`Model ${index} yüklendi (animasyonsuz)`);
+                        resolve();
+                    },
+                    undefined,
+                    (error) => {
+                        console.error(`Model ${index} yükleme hatası:`, error);
+                        reject(error);
+                    }
+                );
+            });
+        }
+
+        function animateModel(index) {
+            const entry = models[index];
+            if (entry && entry.mixer && entry.mixer._actions.length > 0) {
+                entry.mixer.stopAllAction();
+                entry.animated = true;
+                entry.mixer.time = 0;
+                entry.mixer.update(0);
+                entry.mixer._actions.forEach(action => {
+                    action.reset();
+                    action.play();
+                });
+                console.log(`Model ${index} animasyonu tetiklendi (loop'ta)`);
+                // Açıklama göster (animate'de)
+                document.getElementById('description').textContent = modelDescriptions[index - 1];
+                document.getElementById('description').style.display = 'block';
+            } else {
+                console.log(`Model ${index} için animasyon yok veya mixer hazır değil`);
+            }
+        }
+
+        function deleteModel(index) {
+            const entry = models[index];
+            if (entry) {
+                if (entry.mixer) entry.mixer.stopAllAction();
+                scene.remove(entry.model);
+                entry.model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.geometry.dispose();
+                        child.material.dispose();
+                    }
+                });
+                models[index] = null;
+                console.log(`Model ${index} silindi`);
+                // Açıklama gizle
+                document.getElementById('description').style.display = 'none';
+            }
+        }
+
+        function wait(seconds) {
+            return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        }
+
+        // Ses için
+        const audioLoader = new THREE.AudioLoader();
+        let sound1Buffer, sound2Buffer, sound1, sound2;
+        const soundUrl1 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part1-clean-v3-3-kiddo.mp3';
+        const soundUrl2 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part2-clean-v3-3.mp3';
+        const soundUrl3 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part3-clean-v3-2.mp3';
+        const soundUrl4 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part4-clean-v3-3.mp3';
+        const soundUrl5 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part5-clean-v3-3.mp3';
+        const soundUrl6 = 'https://raw.githubusercontent.com/decentralize-dfw/c2w2runway/main/part6-clean-v3-2.mp3';
+
+
+        // Sesleri baştan yükle (lag'ı önlemek için)
+        audioLoader.load(soundUrl1, (buffer) => {
+            sound1Buffer = buffer;
+            console.log('Sound 1 buffer yüklendi');
+        });
+        audioLoader.load(soundUrl2, (buffer) => {
+            sound2Buffer = buffer;
+            console.log('Sound 2 buffer yüklendi');
+        });
+
+        function playSound1() {
+            if (sound1Buffer) {
+                sound1 = new THREE.Audio(audioListener);
+                sound1.setBuffer(sound1Buffer);
+                sound1.setLoop(false); // Loop yok, istersen true yap
+                sound1.setVolume(0.5);
+                sound1.play();
+                console.log('Sound 1 play edildi');
+            } else {
+                console.error('Sound 1 buffer hazır değil');
+            }
+        }
+
+        function playSound2() {
+            if (sound2Buffer) {
+                sound2 = new THREE.Audio(audioListener);
+                sound2.setBuffer(sound2Buffer);
+                sound2.setLoop(false); // Loop yok, istersen true yap
+                sound2.setVolume(0.5);
+                sound2.play();
+                console.log('Sound 2 play edildi');
+            } else {
+                console.error('Sound 2 buffer hazır değil');
+            }
+        }
+
+        function stopSound1() {
+            if (sound1 && sound1.isPlaying) {
+                sound1.stop();
+                console.log('Sound 1 stop edildi');
+            }
+        }
+
+        function stopSound2() {
+            if (sound2 && sound2.isPlaying) {
+                sound2.stop();
+                console.log('Sound 2 stop edildi');
+            }
+        }
+
+        async function runSequence() {
+            document.getElementById('initiating').style.display = 'block';
+            try {
+                
+await loadModel(1);
+await wait(5);
+document.getElementById('initiating').style.display = 'none'; // 5 sn sonra initiating'i kaldır
+animateModel(1);
+playSound1(); // Animate 1 ile aynı zamanda ses 1 play
+await wait(15);
+await loadModel(2);
+await wait(15);
+
+deleteModel(1);
+animateModel(2);
+await wait(15);
+await loadModel(3);
+await wait(15);
+deleteModel(2);
+
+animateModel(3);
+await wait(15);
+await loadModel(4);
+await wait(15);
+deleteModel(3);
+
+animateModel(4);
+await wait(15);
+await loadModel(5);
+await wait(15);
+deleteModel(4);
+
+animateModel(5);
+await wait(15);
+await loadModel(6);
+await wait(15);
+deleteModel(5);
+
+animateModel(6);
+await wait(15);
+await loadModel(7);
+await wait(15);
+deleteModel(6);
+
+animateModel(7);
+await wait(15);
+await loadModel(8);
+await wait(17);  // iki saniye sekme var
+
+stopSound1(); // Delete 3 ile beraber ses 1 stop     
+playSound2(); // Animate 4 ile aynı zamanda ses 2 play 
+
+deleteModel(7);
+
+animateModel(8);
+await wait(15);
+await loadModel(9);
+await wait(15);
+deleteModel(8);
+
+animateModel(9);
+await wait(15);
+await loadModel(10);
+await wait(15);
+deleteModel(9);
+
+animateModel(10);
+await wait(15);
+await loadModel(11);
+await wait(15);
+deleteModel(10);
+
+animateModel(11);
+await wait(15);
+await loadModel(12);
+await wait(15);
+deleteModel(11);
+
+animateModel(12);
+await wait(15);
+await loadModel(13);
+await wait(15);
+deleteModel(12);
+
+animateModel(13);
+await wait(15);
+await loadModel(14);
+await wait(15);
+deleteModel(13);
+
+animateModel(14);
+await wait(15);
+await loadModel(15);
+await wait(15);
+deleteModel(14);
+
+animateModel(15);
+await wait(15);
+await loadModel(16);
+await wait(15);
+deleteModel(15);
+
+animateModel(16);
+await wait(15);
+await loadModel(17);
+await wait(15);
+deleteModel(16);
+
+animateModel(17);
+await wait(15);
+await loadModel(18);
+await wait(19);  // 4 saniye ekledims
+
+stopSound2(); // 
+playSound3(); // 
+
+deleteModel(17);
+
+animateModel(18);
+await wait(15);
+await loadModel(19);
+await wait(15);
+deleteModel(18);
+
+animateModel(19);
+await wait(15);
+await loadModel(20);
+await wait(15);
+deleteModel(19);
+
+animateModel(20);
+await wait(15);
+await loadModel(21);
+await wait(15);
+deleteModel(20);
+
+animateModel(21);
+await wait(15);
+await loadModel(22);
+await wait(15);
+deleteModel(21);
+
+animateModel(22);
+await wait(15);
+await loadModel(23);
+await wait(15);
+deleteModel(22);
+
+animateModel(23);
+await wait(15);
+await loadModel(24);
+await wait(15);
+deleteModel(23);
+
+animateModel(24);
+await wait(15);
+await loadModel(25);
+await wait(15);
+deleteModel(24);
+
+animateModel(25);
+await wait(15);
+await loadModel(26);
+await wait(15);
+deleteModel(25);
+
+animateModel(26);
+await wait(15);
+await loadModel(27);
+await wait(15);
+deleteModel(26);
+
+animateModel(27);
+await wait(15);
+await loadModel(28);
+await wait(19);  // 4 saniye sekme var
+
+stopSound3(); // 
+playSound4(); // 
+
+
+deleteModel(27);
+
+animateModel(28);
+await wait(15);
+await loadModel(29);
+await wait(15);
+deleteModel(28);
+
+animateModel(29);
+await wait(15);
+await loadModel(30);
+await wait(15);
+deleteModel(29);
+
+animateModel(30);
+await wait(15);
+await loadModel(31);
+await wait(15);
+deleteModel(30);
+
+animateModel(31);
+await wait(15);
+await loadModel(32);
+await wait(15);
+deleteModel(31);
+
+animateModel(32);
+await wait(15);
+await loadModel(33);
+await wait(15);
+deleteModel(32);
+
+animateModel(33);
+await wait(15);
+await loadModel(34);
+await wait(15);
+deleteModel(33);
+
+animateModel(34);
+await wait(15);
+await loadModel(35);
+await wait(15);
+deleteModel(34);
+
+animateModel(35);
+await wait(15);
+await loadModel(36);
+await wait(15);
+deleteModel(35);
+
+animateModel(36);
+await wait(15);
+await loadModel(37);
+await wait(15);
+deleteModel(36);
+
+animateModel(37);
+await wait(15);
+await loadModel(38);
+await wait(20);
+deleteModel(37);
+
+stopSound4(); //  4 bölüm btti
+playSound5(); //  5 bölüm başlıyor
+
+animateModel(38);
+await wait(17);
+await loadModel(39);
+await wait(15);
+deleteModel(38);
+
+animateModel(39);
+await wait(15);
+await loadModel(40);
+await wait(15);
+deleteModel(39);
+
+animateModel(40);
+await wait(15);
+await loadModel(41);
+await wait(15);
+deleteModel(40);
+
+animateModel(41);
+await wait(15);
+await loadModel(42);
+await wait(15);
+deleteModel(41);
+
+animateModel(42);
+await wait(15);
+await loadModel(43);
+await wait(15);
+deleteModel(42);
+
+animateModel(43);
+await wait(15);
+await loadModel(44);
+await wait(15);
+deleteModel(43);
+
+animateModel(44);
+await wait(15);
+await loadModel(45);
+await wait(15);
+deleteModel(44);
+
+animateModel(45);
+await wait(15);
+await loadModel(46);
+await wait(15);
+deleteModel(45);
+
+animateModel(46);
+await wait(15);
+await loadModel(47);
+await wait(16);
+
+stopSound5(); //  5 bölüm btti
+playSound6(); //  6 bölüm başlıyor
+
+deleteModel(46);
+
+animateModel(47);
+await wait(29);
+await loadModel(48);
+await wait(15);
+
+deleteModel(47);
+
+animateModel(48);
+await wait(15);
+await loadModel(14);
+await wait(15);
+deleteModel(48);
+
+//-------------
+
+animateModel(14);
+await wait(15);
+await loadModel(18);
+await wait(15);
+deleteModel(14);
+
+//-------------
+animateModel(18);
+await wait(15);
+await loadModel(49);
+await wait(15);
+deleteModel(18);
+
+animateModel(49);
+await wait(15);
+await loadModel(26);
+await wait(15);
+deleteModel(49);
+
+animateModel(26);
+await wait(15);
+await loadModel(50);
+await wait(15);
+deleteModel(26);
+
+animateModel(50);
+await wait(30);
+
+deleteModel(50);
+
+
+            } catch (error) {
+                console.error('Sekans hatası:', error);
+            } finally {
+                document.getElementById('initiating').style.display = 'none'; // Her halükarda gizle
+                // Experience ended göster ve 3 sn bekle, sonra start button geri getir
+                document.getElementById('ended').style.display = 'block';
+                await wait(3);
+                document.getElementById('ended').style.display = 'none';
+                document.getElementById('startButton').style.display = 'block';
+            }
+        }
+
+        // Start button click event
+        const startButton = document.getElementById('startButton');
+        startButton.addEventListener('click', () => {
+            runSequence();
+            startButton.style.display = 'none';
+        });
+
+        // Full screen button
+        const fullscreenButton = document.getElementById('fullscreenButton');
+        fullscreenButton.addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().then(() => {
+                    fullscreenButton.textContent = 'Exit Fullscreen';
+                }).catch(err => {
+                    console.error('Full screen hatası:', err);
+                });
+            } else {
+                document.exitFullscreen().then(() => {
+                    fullscreenButton.textContent = 'Full Screen';
+                }).catch(err => {
+                    console.error('Exit full screen hatası:', err);
+                });
+            }
+        });
+
+        // Fullscreen change event to update button text (in case exited via ESC or other means)
+        document.addEventListener('fullscreenchange', () => {
+            if (document.fullscreenElement) {
+                fullscreenButton.textContent = 'Exit Fullscreen';
+            } else {
+                fullscreenButton.textContent = 'Full Screen';
+            }
+        });
+
+        // Kamera başlangıç pozisyonu
+        camera.position.set(0, 1.6, 10);
+        camera.lookAt(0, 0, 0);
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (controls.isLocked) {
+                const time = performance.now();
+                const delta = (time - prevTime) / 1000;
+                prevTime = time;
+
+                velocity.x -= velocity.x * 10.0 * delta;
+                velocity.z -= velocity.z * 10.0 * delta;
+                velocity.y -= gravity * delta;
+
+                direction.z = Number(keys.forward) - Number(keys.backward);
+                direction.x = Number(keys.right) - Number(keys.left);
+                direction.normalize();
+
+                if (keys.forward || keys.backward) velocity.z -= direction.z * currentMoveSpeed * delta;
+                if (keys.left || keys.right) velocity.x -= direction.x * currentMoveSpeed * delta;
+
+                if (keys.jump && onFloor) {
+                    velocity.y = jumpVelocity;
+                    onFloor = false;
+                }
+
+                controls.moveRight(-velocity.x * delta);
+                controls.moveForward(-velocity.z * delta);
+                controls.getObject().position.y += (velocity.y * delta);
+
+                if (controls.getObject().position.y < 1.6) {
+                    velocity.y = 0;
+                    controls.getObject().position.y = 1.6;
+                    onFloor = true;
+                }
+            }
+
+            // Tüm aktif mixer'ları güncelle
+            models.forEach(entry => {
+                if (entry && entry.mixer && entry.animated) {
+                    entry.mixer.update(clock.getDelta());
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
+
+
+
+
